@@ -12,7 +12,7 @@ Model name is converted to lowercase for the collection name:
 """
 
 from pydantic import BaseModel, Field
-from typing import Optional
+from typing import Optional, List, Dict, Any
 
 # Example schemas (replace with your own):
 
@@ -38,11 +38,23 @@ class Product(BaseModel):
     category: str = Field(..., description="Product category")
     in_stock: bool = Field(True, description="Whether product is in stock")
 
-# Add your own schemas here:
-# --------------------------------------------------
+# Solana Meme Coin Analyzer schemas
 
-# Note: The Flames database viewer will automatically:
-# 1. Read these schemas from GET /schema endpoint
-# 2. Use them for document validation when creating/editing
-# 3. Handle all database operations (CRUD) directly
-# 4. You don't need to create any database endpoints!
+class AnalysisRequest(BaseModel):
+    query: str = Field(..., description="Token address (Solana) or symbol/search term")
+
+class AnalysisResult(BaseModel):
+    token_address: Optional[str] = None
+    name: Optional[str] = None
+    symbol: Optional[str] = None
+    chain: Optional[str] = None
+    score: float = Field(..., ge=0, le=100)
+    verdict: str
+    metrics: Dict[str, Any]
+    insights: List[str]
+
+class AnalysisRecord(BaseModel):
+    query: str
+    result: AnalysisResult
+    source: str = Field("dexscreener", description="Data source used for analysis")
+    tag: str = Field("meme", description="Classification tag")
