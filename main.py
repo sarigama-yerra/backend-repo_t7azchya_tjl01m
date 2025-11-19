@@ -1,11 +1,12 @@
 import os
-from fastapi import FastAPI, HTTPException, UploadFile, File, Form
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, List
 import requests
+import time
 
-from database import create_document
+from database import create_document, get_documents
 from schemas import (
     AnalysisRequest,
     AnalysisResult,
@@ -14,6 +15,15 @@ from schemas import (
     ChartAnalysisResult,
     ChartAnalysisRecord,
     TradePlan,
+    WalletTrackRequest,
+    WalletRecord,
+    WalletStats,
+    LeaderboardEntry,
+    MACDInput,
+    MACDResult,
+    MACDSignal,
+    Candle,
+    MACDAlertRecord,
 )
 
 app = FastAPI(title="Solana Meme Coin Analyzer API")
@@ -293,6 +303,245 @@ async def analyze_chart(
         pass
 
     return res
+
+# -------- Wallet Tracker (Solscan) --------
+
+SOLSCAN_API = "https://pro-api.solscan.io/v2"
+SOLSCAN_KEY = os.getenv("SOLSCAN_API_KEY") or ""
+HELIUS_API_KEY = os.getenv("HELIUS_API_KEY") or ""
+
+
+def _hdrs():
+    h = {"accept": "application/json"}
+    if SOLSCAN_KEY:
+        h["token"] = SOLSCAN_KEY
+    return h
+
+
+def fetch_wallet_txs(address: str, limit: int = 100) -> List[Dict[str, Any]]:
+    url = f"{SOLSCAN_API}/account/transactions?address={address}&limit={limit}"
+    r = requests.get(url, headers=_hdrs(), timeout=15)
+    if r.status_code != 200:
+        raise HTTPException(status_code=502, detail=f"Solscan error: {r.text[:120]}")
+    j = r.json() or {}
+    return j.get("data") or j.get("tx") or []
+
+
+def compute_wallet_stats(txs: List[Dict[str, Any]], window_sec: int) -> WalletStats:
+    now = int(time.time())
+    start = now - window_sec
+    pnl = 0.0
+    wins = 0
+    losses = 0
+    trades = 0
+    volume = 0.0
+    equity_curve: List[Dict[str, Any]] = []
+
+    # Simplified heuristic: treat positive net token flow valued at price as profit; we don't have full fills.
+    # Filter by time window
+    ftx = [t for t in txs if (t.get("blockTime") or t.get("timestamp") or 0) >= start]
+    ftx.sort(key=lambda x: x.get("blockTime") or x.get("timestamp") or 0)
+
+    running_equity = 0.0
+    for t in ftx:
+        # Attempt to parse instruction summary if available
+        change = 0.0
+        fee = float(t.get("fee") or 0) / 1e9  # SOL to SOL if fee in lamports
+        # If token transfers listed
+        transfers = t.get("tokenTransfers") or t.get("tokenBalanceChanges") or []
+        sol_change = 0.0
+        for tr in transfers:
+            amt = tr.get("changeAmount") or tr.get("amount") or 0
+            decimals = tr.get("decimals") or 9
+            mint = tr.get("mint") or tr.get("tokenAddress")
+            # We don't have USD pricing here; best-effort mark-to-fee as cost proxy
+            if mint == "So11111111111111111111111111111111111111112":
+                sol_change += (float(amt) / (10 ** decimals))
+        # treat negative SOL as cost, positive as revenue
+        change = -sol_change - fee
+        pnl += change
+        volume += abs(sol_change)
+        trades += 1
+        if change > 0:
+            wins += 1
+        elif change < 0:
+            losses += 1
+        running_equity += change
+        equity_curve.append({"t": t.get("blockTime") or t.get("timestamp") or now, "equity_usd": running_equity})
+
+    hit = (wins / trades) if trades else 0.0
+    # Placeholder address/label will be set by caller
+    return WalletStats(address="", label=None, window=str(window_sec), pnl_usd=pnl, wins=wins, losses=losses, hit_rate=hit, trades=trades, volume_usd=volume, equity_curve=equity_curve)  # type: ignore
+
+
+@app.post("/wallets/track")
+def track_wallet(req: WalletTrackRequest):
+    if not req.address:
+        raise HTTPException(status_code=400, detail="address required")
+
+    try:
+        # store basic record; refresh happens on-demand
+        rec = WalletRecord(address=req.address, label=req.label)
+        create_document("walletrecord", rec)
+        return {"status": "tracking", "address": req.address, "label": req.label}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)[:120])
+
+
+@app.get("/wallets/{address}/stats", response_model=WalletStats)
+def wallet_stats(address: str, window: str = Query("7d", regex="^(1d|7d|30d)$")):
+    # Window map
+    win_map = {"1d": 86400, "7d": 7*86400, "30d": 30*86400}
+    ws = win_map.get(window, 7*86400)
+    txs = fetch_wallet_txs(address, limit=200)
+    stats = compute_wallet_stats(txs, ws)
+    stats.address = address
+    stats.label = None
+    stats.window = window
+    try:
+        create_document("walletstats", stats)
+    except Exception:
+        pass
+    return stats
+
+
+@app.get("/wallets/leaderboard", response_model=List[LeaderboardEntry])
+def wallet_leaderboard(window: str = Query("7d", regex="^(1d|7d|30d)$"), sort: str = Query("pnl", regex="^(pnl|hit_rate|trades)$")):
+    # Pull recent cached stats and recompute for a set of tracked wallets
+    wallets = get_documents("walletrecord") if True else []
+    entries: List[LeaderboardEntry] = []
+    for w in wallets:
+        addr = w.get("address")
+        label = w.get("label")
+        try:
+            s = wallet_stats(addr, window)  # compute on the fly; could cache later
+            entries.append(LeaderboardEntry(address=addr, label=label, pnl_usd=s.pnl_usd, hit_rate=s.hit_rate, trades=s.trades))
+        except Exception:
+            continue
+    if sort == "pnl":
+        entries.sort(key=lambda x: x.pnl_usd, reverse=True)
+    elif sort == "hit_rate":
+        entries.sort(key=lambda x: x.hit_rate, reverse=True)
+    else:
+        entries.sort(key=lambda x: x.trades, reverse=True)
+    return entries[:50]
+
+# -------- MACD Bot --------
+
+
+def _tf_to_seconds(tf: str) -> int:
+    tf = tf.lower().strip()
+    if tf.endswith("m"):
+        return int(tf[:-1]) * 60
+    if tf.endswith("h"):
+        return int(tf[:-1]) * 3600
+    if tf.endswith("d"):
+        return int(tf[:-1]) * 86400
+    return 3600
+
+
+def fetch_candles_helius(mint: str, timeframe: str, limit: int = 200) -> List[Candle]:
+    # Helius Aggregated OHLCV endpoint (if available). Fallback to Birdeye-style or public sources if needed.
+    base = f"https://api.helius.xyz/v0/token-metrics/ohlcv?api-key={HELIUS_API_KEY}"
+    # Not all environments expose this exact endpoint; we do a best-effort and accept failure gracefully.
+    params = {
+        "mint": mint,
+        "timeframe": timeframe,
+        "limit": str(limit)
+    }
+    try:
+        r = requests.get(base, params=params, timeout=15)
+        if r.status_code != 200:
+            return []
+        j = r.json() or {}
+        rows = j.get("data") or j.get("candles") or []
+        candles: List[Candle] = []
+        for row in rows:
+            t = int(row.get("t") or row.get("startTime") or 0)
+            o = float(row.get("o") or row.get("open") or 0)
+            h = float(row.get("h") or row.get("high") or o)
+            l = float(row.get("l") or row.get("low") or o)
+            c = float(row.get("c") or row.get("close") or o)
+            v = float(row.get("v") or row.get("volume") or 0)
+            candles.append(Candle(t=t, o=o, h=h, l=l, c=c, v=v))
+        return candles
+    except Exception:
+        return []
+
+
+def compute_macd(closes: List[float], fast: int = 12, slow: int = 26, signal: int = 9):
+    def ema(series: List[float], period: int) -> List[float]:
+        if not series:
+            return []
+        k = 2 / (period + 1)
+        out: List[float] = []
+        prev = series[0]
+        out.append(prev)
+        for x in series[1:]:
+            prev = x * k + prev * (1 - k)
+            out.append(prev)
+        return out
+    if len(closes) < max(slow, fast) + signal:
+        return [], [], []
+    ema_fast = ema(closes, fast)
+    ema_slow = ema(closes, slow)
+    macd_line = [f - s for f, s in zip(ema_fast[-len(ema_slow):], ema_slow)]
+    sig_line = ema(macd_line, signal)
+    # Align lengths
+    L = min(len(macd_line), len(sig_line))
+    macd_line = macd_line[-L:]
+    sig_line = sig_line[-L:]
+    hist = [m - s for m, s in zip(macd_line, sig_line)]
+    return macd_line, sig_line, hist
+
+
+def detect_crossovers(candles: List[Candle], macd_line: List[float], sig_line: List[float]) -> List[MACDSignal]:
+    signals: List[MACDSignal] = []
+    L = min(len(candles), len(macd_line), len(sig_line))
+    for i in range(1, L):
+        prev_diff = macd_line[i-1] - sig_line[i-1]
+        cur_diff = macd_line[i] - sig_line[i]
+        if prev_diff <= 0 and cur_diff > 0:
+            signals.append(MACDSignal(time=candles[i].t, type="bullish", macd=macd_line[i], signal=sig_line[i], histogram=macd_line[i]-sig_line[i]))
+        elif prev_diff >= 0 and cur_diff < 0:
+            signals.append(MACDSignal(time=candles[i].t, type="bearish", macd=macd_line[i], signal=sig_line[i], histogram=macd_line[i]-sig_line[i]))
+    return signals
+
+
+def ai_confidence(timeframe: str, volatility: float, recent_signals: int) -> float:
+    base = 0.55 if timeframe in ("1h", "4h") else 0.5
+    base += min(0.1, volatility / 100)
+    base -= min(0.1, max(0, recent_signals - 3) * 0.02)
+    return max(0.4, min(0.9, base))
+
+
+@app.get("/indicator/macd/analyze", response_model=MACDResult)
+def macd_analyze(query: str = Query(...), timeframe: str = Query("1h")):
+    # Query is a token mint address for Solana
+    mint = query.strip()
+    candles = fetch_candles_helius(mint, timeframe, limit=300)
+    if not candles:
+        raise HTTPException(status_code=502, detail="No candles available from provider")
+    closes = [c.c for c in candles]
+    macd_line, sig_line, hist = compute_macd(closes)
+    if not macd_line:
+        raise HTTPException(status_code=400, detail="Insufficient data for MACD")
+    signals = detect_crossovers(candles[-len(macd_line):], macd_line, sig_line)
+
+    # Volatility proxy: average true range percent (rough)
+    rng = [((c.h - c.l) / c.c * 100) if c.c else 0 for c in candles[-50:]]
+    vol = sum(rng) / len(rng) if rng else 0
+    conf = ai_confidence(timeframe, vol, len([s for s in signals if s.time >= candles[-50].t]))
+
+    # Persist most recent signal best-effort
+    try:
+        if signals:
+            rec = MACDAlertRecord(query=mint, timeframe=timeframe, signal=signals[-1])
+            create_document("macdalerts", rec)
+    except Exception:
+        pass
+
+    return MACDResult(query=mint, timeframe=timeframe, candles=candles[-200:], macd=macd_line[-200:], signal=sig_line[-200:], histogram=hist[-200:], signals=signals[-50:], confidence=conf)
 
 if __name__ == "__main__":
     import uvicorn

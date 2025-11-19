@@ -86,3 +86,76 @@ class ChartAnalysisRecord(BaseModel):
     request: ChartAnalysisRequest
     result: ChartAnalysisResult
     tag: str = Field("chart_ai", description="Classification tag for chart AI")
+
+# -------- Wallet Tracker Schemas --------
+
+class WalletTrackRequest(BaseModel):
+    address: str = Field(..., description="Solana wallet address")
+    label: Optional[str] = Field(None, description="Optional label for the wallet")
+
+class WalletRecord(BaseModel):
+    address: str
+    label: Optional[str] = None
+    last_refreshed: Optional[str] = None
+    notes: Optional[str] = None
+    source: str = Field("solscan", description="Primary data source")
+
+class WalletTimeseriesPoint(BaseModel):
+    t: int
+    equity_usd: float
+
+class WalletStats(BaseModel):
+    address: str
+    label: Optional[str] = None
+    window: str
+    pnl_usd: float
+    wins: int
+    losses: int
+    hit_rate: float
+    trades: int
+    volume_usd: float
+    equity_curve: List[WalletTimeseriesPoint] = []
+
+class LeaderboardEntry(BaseModel):
+    address: str
+    label: Optional[str] = None
+    pnl_usd: float
+    hit_rate: float
+    trades: int
+
+# -------- MACD Schemas --------
+
+class MACDInput(BaseModel):
+    query: str = Field(..., description="Token address, pair address, or search term")
+    timeframe: str = Field(..., description="e.g., 5m, 15m, 1h, 4h, 1d")
+
+class Candle(BaseModel):
+    t: int
+    o: float
+    h: float
+    l: float
+    c: float
+    v: Optional[float] = None
+
+class MACDSignal(BaseModel):
+    time: int
+    type: str = Field(..., description="bullish or bearish")
+    macd: float
+    signal: float
+    histogram: float
+
+class MACDResult(BaseModel):
+    query: str
+    timeframe: str
+    candles: List[Candle]
+    macd: List[float]
+    signal: List[float]
+    histogram: List[float]
+    signals: List[MACDSignal]
+    confidence: float = Field(..., ge=0, le=1)
+
+class MACDAlertRecord(BaseModel):
+    query: str
+    timeframe: str
+    signal: MACDSignal
+    tag: str = Field("macd", description="Classifier tag for MACD alerts")
