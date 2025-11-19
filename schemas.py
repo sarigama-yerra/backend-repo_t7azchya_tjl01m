@@ -58,3 +58,31 @@ class AnalysisRecord(BaseModel):
     result: AnalysisResult
     source: str = Field("dexscreener", description="Data source used for analysis")
     tag: str = Field("meme", description="Classification tag")
+
+# Chart AI schemas
+
+class ChartAnalysisRequest(BaseModel):
+    timeframe: str = Field(..., description="Timeframe of the chart, e.g., 5m, 15m, 1h, 4h, 1d")
+    notes: Optional[str] = Field(None, description="Optional notes or context about the snippet")
+
+class TradePlan(BaseModel):
+    side: str = Field(..., description="long or short")
+    entry: float = Field(..., gt=0)
+    stop_loss: float = Field(..., gt=0)
+    take_profit_1: float = Field(..., gt=0)
+    take_profit_2: Optional[float] = Field(None, gt=0)
+    risk_reward: float = Field(..., gt=0)
+
+class ChartAnalysisResult(BaseModel):
+    timeframe: str
+    trend: str
+    momentum: str
+    confidence: float = Field(..., ge=0, le=1)
+    key_levels: Dict[str, float]
+    trade: TradePlan
+    rationale: List[str]
+
+class ChartAnalysisRecord(BaseModel):
+    request: ChartAnalysisRequest
+    result: ChartAnalysisResult
+    tag: str = Field("chart_ai", description="Classification tag for chart AI")

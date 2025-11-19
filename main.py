@@ -1,12 +1,20 @@
 import os
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 import requests
 
 from database import create_document
-from schemas import AnalysisRequest, AnalysisResult, AnalysisRecord
+from schemas import (
+    AnalysisRequest,
+    AnalysisResult,
+    AnalysisRecord,
+    ChartAnalysisRequest,
+    ChartAnalysisResult,
+    ChartAnalysisRecord,
+    TradePlan,
+)
 
 app = FastAPI(title="Solana Meme Coin Analyzer API")
 
@@ -172,6 +180,119 @@ def analyze_token(req: AnalysisRequest):
         pass
 
     return analysis
+
+# --- Chart AI: analyze uploaded chart image and propose trade plan ---
+
+def _infer_chart_context(filename: str, file_size: int, timeframe: str, notes: Optional[str]) -> Dict[str, Any]:
+    """Lightweight heuristics to infer trend/momentum from metadata and notes."""
+    tf = timeframe.lower().strip()
+    trend = "sideways"
+    momentum = "neutral"
+
+    if notes:
+        n = notes.lower()
+        if any(k in n for k in ["breakout", "uptrend", "bull", "higher high"]):
+            trend = "up"
+            momentum = "increasing"
+        elif any(k in n for k in ["breakdown", "downtrend", "bear", "lower low"]):
+            trend = "down"
+            momentum = "decreasing"
+        elif "range" in n or "consolid" in n:
+            trend = "sideways"
+            momentum = "compressing"
+
+    # If no notes, nudge based on timeframe
+    if trend == "sideways":
+        if tf in ("1m", "3m", "5m", "15m"):
+            momentum = "increasing"
+        elif tf in ("1h", "4h", "1d"):
+            momentum = "neutral"
+
+    # Confidence: more context => higher; larger files (higher resolution) => slightly higher
+    base_conf = 0.5
+    if notes:
+        base_conf += 0.15
+    if file_size > 500_000:
+        base_conf += 0.1
+    base_conf = max(0.35, min(0.9, base_conf))
+
+    return {"trend": trend, "momentum": momentum, "confidence": base_conf}
+
+
+def _propose_trade(trend: str, timeframe: str) -> TradePlan:
+    tf = timeframe.lower().strip()
+    # default parameters (percent offsets)
+    rr = 2.0 if tf in ("1m", "3m", "5m", "15m") else 2.5
+    if trend == "up":
+        side = "long"
+        entry = -0.002  # -0.20% pullback entry
+        stop = -0.01    # -1.00% stop
+        tp1 = 0.01      # +1.00%
+        tp2 = 0.02      # +2.00%
+    elif trend == "down":
+        side = "short"
+        entry = 0.002   # +0.20% bounce entry
+        stop = 0.01     # +1.00% invalidation
+        tp1 = -0.01     # -1.00%
+        tp2 = -0.02     # -2.00%
+    else:
+        # range play: mean reversion with tighter stops
+        side = "long"
+        entry = -0.001
+        stop = -0.006
+        tp1 = 0.006
+        tp2 = 0.012
+    return TradePlan(side=side, entry=abs(entry), stop_loss=abs(stop), take_profit_1=abs(tp1), take_profit_2=abs(tp2), risk_reward=rr)
+
+
+@app.post("/chart/analyze", response_model=ChartAnalysisResult)
+async def analyze_chart(
+    file: UploadFile = File(...),
+    timeframe: str = Form(...),
+    notes: Optional[str] = Form(None),
+):
+    # Validate timeframe basic pattern
+    tf = timeframe.lower().strip()
+    if not tf:
+        raise HTTPException(status_code=400, detail="Timeframe is required")
+
+    # Read file to infer size (no heavy image processing to keep it lightweight)
+    content = await file.read()
+    file_size = len(content)
+
+    ctx = _infer_chart_context(file.filename or "chart.png", file_size, tf, notes)
+    trade = _propose_trade(ctx["trend"], tf)
+
+    # Construct key levels as percentage offsets for user to map to price
+    key_levels = {
+        "entry_offset_pct": trade.entry * 100,
+        "stop_offset_pct": trade.stop_loss * 100,
+        "tp1_offset_pct": trade.take_profit_1 * 100,
+        "tp2_offset_pct": (trade.take_profit_2 or 0) * 100,
+    }
+
+    res = ChartAnalysisResult(
+        timeframe=tf,
+        trend=ctx["trend"],
+        momentum=ctx["momentum"],
+        confidence=ctx["confidence"],
+        key_levels=key_levels,
+        trade=trade,
+        rationale=[
+            "Heuristic derived from timeframe and provided notes",
+            "Levels are percentage offsets from current price; map to your chart",
+            "Consider liquidity and higher timeframe bias before execution",
+        ],
+    )
+
+    # persist (best-effort)
+    try:
+        rec = ChartAnalysisRecord(request=ChartAnalysisRequest(timeframe=tf, notes=notes), result=res)
+        create_document("chartanalysisrecord", rec)
+    except Exception:
+        pass
+
+    return res
 
 if __name__ == "__main__":
     import uvicorn
